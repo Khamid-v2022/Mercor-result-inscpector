@@ -7,7 +7,7 @@
 //   - section > details > summary h2       -> module title
 //   - [role="group"] > label               -> custom field (Harbor results)
 //   - textarea / [data-lexical-editor] / pre code / [role="combobox"] -> field values
-//   - span.text-base.font-semibold          -> QC group header (Major issues / Passed / Neutral ...)
+//   - span.whitespace-nowrap.text-base.font-semibold -> QC group header (Minor issues / Passed / ...)
 //   - div.rounded-xl.border                 -> QC card
 //   - h4 "Other findings"                   -> open-world findings list
 // Everything else falls back to cleaned innerText so unknown sections are still captured.
@@ -19,10 +19,12 @@
     includeHarbor: true,
     includeRawJson: true,
     includeDescriptions: false,
-    includeOther: true,
     expandCollapsed: true,
     rawJsonLimit: 2000,
   };
+
+  // Sections that are chrome around the result, not part of the prompt.
+  const SKIP_MODULE = /^(actions|task package|history|jobs and feedback|metadata|run outputs)$/i;
 
   const NOISE_LINE =
     /^(Agree|Dispute|Comment|Add to rerun|Neutral|Expand findings|Collapse findings|Show comments|Hide output|Show output|Show less|Show more)$/i;
@@ -87,6 +89,30 @@
 
   // ---------- expansion helpers ----------
 
+  function clickShowMore(root) {
+    let n = 0;
+    root.querySelectorAll('button').forEach((b) => {
+      if (/^show more$/i.test(text(b))) {
+        b.click();
+        n++;
+      }
+    });
+    return n;
+  }
+
+  // Finding rows inside a QC card render only their title until clicked.
+  // The toggle is a plain button (no aria-expanded) with a right-facing chevron.
+  function clickCollapsedFindings(root) {
+    let n = 0;
+    root.querySelectorAll('button').forEach((b) => {
+      if (!/Finding #\d+/.test(b.innerText || '')) return;
+      if (!b.querySelector('svg.lucide-chevron-right')) return;
+      b.click();
+      n++;
+    });
+    return n;
+  }
+
   async function expandAll(root) {
     let clicked = 0;
     root.querySelectorAll('details:not([open])').forEach((d) => {
@@ -105,25 +131,23 @@
         const t = text(b);
         if (/show output/i.test(t) || /severity/i.test(t)) clickIf(b);
       });
-    // QC cards: nested findings and collapsed non-passed cards
+    // QC cards: collapsed non-passed cards. Passed cards stay collapsed (titles only).
     root.querySelectorAll('button[aria-label="Expand findings"]').forEach(clickIf);
-    root.querySelectorAll('span.text-base.font-semibold').forEach((h) => {
+    root.querySelectorAll('span.whitespace-nowrap.text-base.font-semibold').forEach((h) => {
       if (/^passed$/i.test(text(h))) return;
       const group = h.parentElement;
       if (!group) return;
-      group
-        .querySelectorAll('button[aria-expanded="false"]')
-        .forEach((b) => {
-          // only header toggles (they contain the chevron svg), not action buttons
-          if (b.querySelector('svg.lucide-chevron-right, svg.lucide-chevron-down')) clickIf(b);
-        });
+      group.querySelectorAll('button[aria-expanded="false"]').forEach((b) => {
+        if (b.querySelector('svg.lucide-chevron-right, svg.lucide-chevron-down')) clickIf(b);
+      });
     });
-    // truncated descriptions
-    root.querySelectorAll('button').forEach((b) => {
-      if (/^show more$/i.test(text(b))) clickIf(b);
-    });
+    clicked += clickShowMore(root);
     if (clicked) await sleep(450);
-    return clicked;
+
+    // Findings only exist in the DOM once their parent card is open, so this is a second pass.
+    const findings = clickCollapsedFindings(root);
+    if (findings) await sleep(450);
+    if (clickShowMore(root)) await sleep(450);
   }
 
   // ---------- module helpers ----------
@@ -309,12 +333,9 @@
 
   function extractQcModule(mod, opts, level) {
     const lines = [];
-    const latest = [...mod.querySelectorAll('[data-slot="dropdown-menu-trigger"]')].find((b) =>
-      /latest run/i.test(b.innerText)
-    );
-    if (latest) lines.push(oneLine(latest.innerText), '');
-
-    const headers = [...mod.querySelectorAll('span.text-base.font-semibold')];
+    // whitespace-nowrap distinguishes group headers (Minor issues / Passed / ...)
+    // from summary banners such as "5 passed · 1 neutral".
+    const headers = [...mod.querySelectorAll('span.whitespace-nowrap.text-base.font-semibold')];
     headers.forEach((h) => {
       const group = h.parentElement;
       const title = oneLine(h.innerText);
@@ -348,18 +369,6 @@
     return lines;
   }
 
-  // ---------- Harbor QA runner (Lint / Check / Golden / Run ...) ----------
-
-  function extractRunnerModule(mod) {
-    const lines = [];
-    mod.querySelectorAll('span.text-sm.font-medium.truncate').forEach((s) => {
-      const row = s.closest('.space-y-2');
-      const pre = row ? row.querySelector('pre') : null;
-      lines.push(`- ${oneLine(s.innerText)}: ${pre ? oneLine(pre.innerText) : '(not run)'}`);
-    });
-    return lines;
-  }
-
   // ---------- generic ----------
 
   function extractGeneric(mod) {
@@ -379,24 +388,23 @@
 
   function extractModule(mod, opts, level, out) {
     const title = moduleTitle(mod);
-    if (/^actions$/i.test(title)) return;
+    if (SKIP_MODULE.test(title)) return;
     const kids = childModules(mod);
     if (kids.length) {
-      if (title) out.push(heading(level, title));
+      // "Harbor QA (eval)" only wraps Harbor results; keep the results, drop the wrapper heading.
+      const skipHeading = /^harbor qa \(eval\)$/i.test(title);
+      if (title && !skipHeading) out.push(heading(level, title));
       const sub = moduleSubtitle(mod);
-      if (sub && opts.includeDescriptions) out.push(`> ${sub.replace(/\n+/g, ' ')}`);
-      out.push('');
-      kids.forEach((k) => extractModule(k, opts, level + 1, out));
+      if (!skipHeading && sub && opts.includeDescriptions) out.push(`> ${sub.replace(/\n+/g, ' ')}`);
+      if (title && !skipHeading) out.push('');
+      kids.forEach((k) => extractModule(k, opts, skipHeading ? level : level + 1, out));
       return;
     }
     const kind = detectKind(mod);
+    if (kind === 'package' || kind === 'runner') return;
     let body = [];
-    if (kind === 'package') {
-      const zip = mod.querySelector('span[title$=".zip"], span.truncate[title]');
-      body = [`Package: ${zip ? oneLine(zip.textContent) : '(no upload)'}`];
-    } else if (kind === 'qc') body = extractQcModule(mod, opts, level + 1);
+    if (kind === 'qc') body = extractQcModule(mod, opts, level + 1);
     else if (kind === 'fields') body = extractFieldsModule(mod, opts, level + 1);
-    else if (kind === 'runner') body = extractRunnerModule(mod);
     else body = extractGeneric(mod);
 
     if (!body.length || body.every((l) => !l)) return;
@@ -406,74 +414,30 @@
     out.push(...body, '');
   }
 
-  // ---------- page header ----------
-
-  function pageHeader() {
-    const lines = [];
-    const crumbs = [...document.querySelectorAll('nav[aria-label="breadcrumb"] li span[title]')];
-    const taskName = crumbs.length ? oneLine(crumbs[crumbs.length - 1].textContent) : document.title;
-    let status = '';
-    const nav = document.querySelector('nav[aria-label="breadcrumb"]');
-    if (nav && nav.parentElement) {
-      const badge = nav.parentElement.querySelector('[data-slot="badge"]');
-      if (badge) status = oneLine(badge.textContent);
-    }
-    const proj = document.querySelector('header [data-slot="popover-trigger"] span.font-medium');
-    lines.push(`# Mercor Studio QA Result: ${taskName}`);
-    if (proj) lines.push(`Project: ${oneLine(proj.textContent)}`);
-    if (status) lines.push(`Status: ${status}`);
-    lines.push(`URL: ${location.href}`);
-    lines.push(`Captured: ${new Date().toISOString()}`);
-    lines.push('');
-    return lines;
-  }
-
   // ---------- main ----------
 
   window.__mercorExtract = async function (options) {
     const opts = Object.assign({}, DEFAULTS, options || {});
     const mainEl = document.querySelector('main') || document.body;
-    const leftPanel = document.querySelector('[data-panel-id="main"]') || mainEl;
     const rightPanel = document.querySelector('[data-panel-id="right-sidebar"]');
 
-    // Hidden tab panes (Jobs and Feedback / Metadata) render with display:none, which makes
-    // innerText return "". Temporarily reveal them so they can be read, then restore.
-    const revealed = [];
-    document.querySelectorAll('div.hidden > [data-module-instance-id]').forEach((m) => {
-      const p = m.parentElement;
-      if (!revealed.includes(p)) revealed.push(p);
+    if (opts.expandCollapsed) await expandAll(mainEl);
+
+    const out = [];
+    const qc = [];
+    const harbor = [];
+
+    topLevelModules(mainEl).forEach((mod) => {
+      const bucket = rightPanel && rightPanel.contains(mod) ? qc : harbor;
+      extractModule(mod, opts, 2, bucket);
     });
 
-    try {
-      if (opts.expandCollapsed) await expandAll(mainEl);
-      revealed.forEach((p) => p.classList.remove('hidden'));
+    if (opts.includeQc && qc.length) out.push(...qc);
+    if (opts.includeHarbor && harbor.length) out.push(...harbor);
 
-      const out = [...pageHeader()];
-      const qc = [];
-      const harbor = [];
-      const other = [];
-
-      topLevelModules(mainEl).forEach((mod) => {
-        const isRight = !!(rightPanel && rightPanel.contains(mod));
-        const isHiddenTab = revealed.includes(mod.parentElement);
-        const title = moduleTitle(mod);
-        let bucket;
-        if (isHiddenTab || /history/i.test(title)) bucket = other;
-        else if (isRight) bucket = qc;
-        else bucket = harbor;
-        extractModule(mod, opts, 2, bucket);
-      });
-
-      if (opts.includeQc && qc.length) out.push(...qc);
-      if (opts.includeHarbor && harbor.length) out.push(...harbor);
-      if (opts.includeOther && other.length) out.push(...other);
-
-      if (out.length <= 6) {
-        out.push('(No Studio modules found on this page. Open a task detail page with results.)');
-      }
-      return norm(out.join('\n')) + '\n';
-    } finally {
-      revealed.forEach((p) => p.classList.add('hidden'));
+    if (!out.length) {
+      out.push('(No Studio modules found on this page. Open a task detail page with results.)');
     }
+    return norm(out.join('\n')) + '\n';
   };
 })();

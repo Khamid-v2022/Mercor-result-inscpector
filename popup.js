@@ -3,7 +3,6 @@ const OPTION_IDS = [
   'includeHarbor',
   'includeRawJson',
   'includeDescriptions',
-  'includeOther',
   'expandCollapsed',
 ];
 const STORAGE_KEY = 'mercor-result-inspector.options';
