@@ -185,16 +185,38 @@
 
   // ---------- custom fields (Harbor results, Review Feedback, Metadata ...) ----------
 
+  // innerText is empty while a tab pane is display:none; textContent still has the copy.
+  function blockText(el) {
+    if (!el) return '';
+    const visible = el.innerText != null ? norm(el.innerText) : '';
+    return visible || norm(el.textContent);
+  }
+
+  function inlineText(el) {
+    let s = '';
+    el.childNodes.forEach((node) => {
+      if (node.nodeType === 3) s += node.textContent;
+      else if (node.nodeType === 1) {
+        const tag = node.tagName.toLowerCase();
+        if (tag === 'br') s += '\n';
+        else if (tag === 'code') s += '`' + (node.textContent || '').replace(/`/g, '') + '`';
+        else s += inlineText(node);
+      }
+    });
+    return norm(s);
+  }
+
   function mdFromEditor(root) {
     const out = [];
     for (const el of root.children) {
       const tag = el.tagName.toLowerCase();
       if (tag === 'ul' || tag === 'ol') {
         [...el.children].forEach((li, i) => {
-          out.push((tag === 'ol' ? `${i + 1}. ` : '- ') + oneLine(li.innerText));
+          out.push((tag === 'ol' ? `${i + 1}. ` : '- ') + oneLine(inlineText(li)));
         });
       } else {
-        out.push(norm(el.innerText));
+        const line = inlineText(el);
+        if (line) out.push(line);
       }
     }
     return out.join('\n');
@@ -369,6 +391,43 @@
     return lines;
   }
 
+  // ---------- Jobs and Feedback (Review Feedback only; Run outputs stays out) ----------
+
+  function extractReviewHistory(mod, level, index) {
+    const lines = [heading(level, `${index}. Review History`)];
+    const entries = [...mod.querySelectorAll('[data-testid="review-history-entry"]')];
+    if (!entries.length) {
+      lines.push('(empty)', '');
+      return lines;
+    }
+    entries.forEach((entry) => {
+      const row = entry.firstElementChild;
+      const bits = row
+        ? [...row.children]
+            .map((el) => oneLine(el.textContent).replace(/^[·•]\s*/, '').trim())
+            .filter((s) => s && s !== '·')
+        : [];
+      lines.push(heading(level + 1, bits.join(' · ') || 'Review round'));
+      const prose = entry.querySelector('.prose');
+      const body = prose ? mdFromEditor(prose) : blockText(entry);
+      lines.push(...(body ? body.split('\n') : ['(empty)']));
+      lines.push('');
+    });
+    return lines;
+  }
+
+  function extractJobs(mod, opts, out) {
+    const review = childModules(mod).find((k) => /^review feedback$/i.test(moduleTitle(k)));
+    if (!review) return;
+    const lines = extractFieldsModule(review, opts, 3);
+    const n = [...review.querySelectorAll('[role="group"]')].filter(
+      (g) => g.querySelector('label') && !g.querySelector('[role="group"]')
+    ).length;
+    lines.push(...extractReviewHistory(review, 3, n + 1));
+    out.push(heading(2, 'Jobs and Feedback'), '');
+    out.push(...lines);
+  }
+
   // ---------- generic ----------
 
   function extractGeneric(mod) {
@@ -425,14 +484,20 @@
 
     const out = [];
     const qc = [];
+    const feedback = [];
     const harbor = [];
 
     topLevelModules(mainEl).forEach((mod) => {
+      if (/^jobs and feedback$/i.test(moduleTitle(mod))) {
+        extractJobs(mod, opts, feedback);
+        return;
+      }
       const bucket = rightPanel && rightPanel.contains(mod) ? qc : harbor;
       extractModule(mod, opts, 2, bucket);
     });
 
     if (opts.includeQc && qc.length) out.push(...qc);
+    if (feedback.length) out.push(...feedback);
     if (opts.includeHarbor && harbor.length) out.push(...harbor);
 
     if (!out.length) {
